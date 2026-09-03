@@ -1,0 +1,617 @@
+---
+title: "Country-Level Predictors of Confidence in Social Institutions"
+subtitle: "A World Values Survey analysis with a focus on Japan"
+author: "Hugh Trinh"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+## About this piece
+
+This notebook is a personal, restructured version of a data analytics assignment I completed
+(FIT3152, Monash University): analysing country-level predictors of confidence in social
+institutions using the World Values Survey (WVS) Wave 7 data.
+
+My assigned focus country is **Japan (JPN)**. The four themes are:
+
+1. **Data overview & quality:** what the survey extract looks like before any modelling.
+2. **How Japan differs from the rest of the world:** a multivariate comparison of average responses.
+3. **Finding a cluster of countries similar to Japan:** using external governance indicators (World Bank WGI) and k-means.
+4. **Predicting confidence in social institutions:** comparing how well participant attributes predict institutional confidence for Japan alone, for the rest of the world pooled together, and for Japan's cluster of similar countries.
+
+---
+
+## Setup and data
+
+The data is a per-student random subset of the WVS Wave 7 extract: 50,000 respondents and a
+personally-assigned set of 40 columns (a fixed 13 identifier/demographic columns, 17 randomly
+sampled "value/attitude" predictors, and 10 randomly sampled confidence-in-institutions
+outcomes), drawn with a seed tied to my student ID so the subset is reproducible.
+
+```{r setup-data}
+library(ggplot2)
+library(GGally)
+library(tidyr)
+library(reshape2)
+
+id <- as.numeric(Sys.getenv("STUDENT_ID"))
+set.seed(id)
+VCData = read.csv("WVSExtract.csv")
+VC = VCData[sample(1:nrow(VCData), 50000, replace = FALSE), ]
+VC = VC[, c(1:6, sort(sample(7:46, 17, replace = FALSE)), 47:53,
+            sort(sample(54:69, 10, replace = FALSE)))]
+```
+
+---
+
+## Theme 1: Data overview and quality
+
+The dataset has 50,000 observations across 40 variables. All variables are integer-coded except
+`Country`, which is character (the ISO3 country code).
+
+```{r desc-dim}
+dim(VC)
+str(VC)
+```
+
+There are 65 countries in the dataset, and the number of respondents per country varies quite a
+lot. This is a real imbalance to keep in mind for anything that pools countries together.
+
+```{r desc-country}
+length(unique(VC$Country))            # Number of countries
+min(table(VC$Country))                # Lowest number of instances by country
+max(table(VC$Country))                # Highest number of instances by country
+```
+
+Cyprus (CYP) appears the least, with 510 respondents, while Canada (CAN) appears the most, with
+2,085.
+
+Looking at `summary(VC)`, every numerical attribute has a minimum value of -5, which is not a
+real response. Per the WVS Wave 7 documentation, values from -5 to -1 are missing-data
+codes (refused, don't know, not applicable, etc.), not genuine scale points.
+
+```{r desc-summary}
+summary(VC)
+```
+
+To see how missing values are distributed across attributes, I count how many values of each
+predictor fall in the negative (missing-code) range:
+
+```{r desc-missing, fig.cap="Figure 1: Missing value count by variable"}
+count_missing = function() {
+  counts = data.frame(country = character(), missing_count = numeric(), percentage = numeric())
+  for (col in names(VC[, -1])) {
+    count = colSums(VC[, -1] < 0)[col]
+    counts[nrow(counts) + 1, ] = data.frame(
+      country = col,
+      missing_count = count,
+      percentage = count / nrow(VC) * 100
+    )
+  }
+  rownames(counts) = NULL
+  return(counts)
+}
+missing_values = count_missing()
+head(missing_values)
+
+ggplot(missing_values, aes(x = country, y = missing_count)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 0.5)) +
+  labs(x = "Variable", y = "Missing count", title = "Missing values by variable")
+```
+
+The number of missing values varies quite a bit from attribute to attribute. Respondent's sex
+(`MF`) has the fewest missing values (55 instances, 0.11%) whereas confidence in
+environmental protection movements (`CEnvOrg`) has the most, at 3,287 (6.57%) of all responses.
+Confidence-related questions and the science/technology-attitude questions tend to sit at the
+higher end, while demographic and trust questions tend to sit at the lower end.
+
+For everything that follows, I replace the missing-data codes with proper `NA`s so they don't
+get treated as real responses:
+
+```{r desc-na}
+VC[VC < 0 & VC >= -5] = NA
+```
+
+---
+
+## Theme 2: How does Japan differ from the rest of the world?
+
+To see how Japanese respondents compare to everyone else, I split the sample into "JPN" and
+"Others", z-score standardise every numeric variable (so variables on very different scales are
+comparable), and take the average response of each group.
+
+```{r q2a-prep}
+scaled_VC = as.data.frame(lapply(VC, function(col) {
+  if (is.numeric(col)) scale(col) else col
+})) # Scaling data
+
+VC_JPN_Others_raw = VC
+VC_JPN_Others_raw$Country = ifelse(VC$Country == "JPN", "JPN", "Others")
+
+VC_JPN_Others = scaled_VC
+VC_JPN_Others$Country = ifelse(VC$Country == "JPN", "JPN", "Others")
+response_JPN_Others = t(aggregate(. ~ Country, VC_JPN_Others, mean)[, -1])
+colnames(response_JPN_Others) = c("JPN", "Others")
+```
+
+The heat map below shows the (standardised) difference between the average Japanese response and
+the average response from every other country pooled together.
+
+```{r q2a-heatmap, fig.width=6.5, fig.height=8, fig.cap="Figure 2: Differences between responses in Japan and responses in other countries"}
+heat_map_difference = function(data, col_1, col_2) {
+  difference = data[, col_1] - data[, col_2]
+  heat_map_data = data.frame(variables = rownames(data), difference = difference)
+  return(ggplot(heat_map_data, aes(x = "", y = variables, fill = difference)) +
+           geom_tile(color = "black", width = 2) +
+           scale_fill_gradient2(
+             low = "#D73027",
+             mid = "white",
+             high = "#1A9850"
+           ) +
+           labs(x = ""))
+}
+heat_map_difference(response_JPN_Others, "JPN", "Others")
+```
+
+Quite a few variables show a substantial difference. The most noticeable is `VReligion`
+(importance of religion in life), which has the largest positive difference: religion
+matters more to Japanese respondents than to respondents elsewhere. `CReligious` (confidence in
+religious institutions) shows the same pattern, which lines up with the `VReligion` result.
+`VWork` (importance of work) is also higher, while `VFamily` (importance of family) is slightly
+*lower*. On average, Japanese respondents place a bit less emphasis on family relative to
+the rest of the world.
+
+Age also stands out: the average age of Japanese respondents (53.5) is noticeably higher than the
+international average (41.7), reflecting Japan's older population.
+
+On the negative side, `PNewspaper` and `PTelevision` (frequency of using newspapers/TV as an
+information source) both register red on the heat map, but for these variables, a *lower*
+value means more frequent use, so this actually means Japanese respondents consume news from
+newspapers and television more often than respondents elsewhere.
+
+`HChoice` (how much control people feel they have over their own life, 1 = none, 10 = a great
+deal) is also clearly lower for Japan, suggesting Japanese respondents feel they have less control
+over their lives on average than respondents elsewhere. Variables like `TFamily`, `SJob`, and
+`TMeet` sit close to zero, meaning Japan looks fairly similar to the rest of the world on those.
+
+---
+
+## Theme 3: Finding a cluster of countries similar to Japan
+
+Rather than comparing Japan to *every* other country as one undifferentiated group, it's also
+worth asking which countries in the survey are genuinely similar to Japan, and whether comparing
+Japan to *those* countries specifically tells a different story. I use external governance data
+from the World Bank's [Worldwide Governance Indicators](http://info.worldbank.org/governance/wgi/)
+(WGI), which includes Voice and Accountability, Regulatory Quality, Political Stability and Absence of
+Violence/Terrorism, Rule of Law, Government Effectiveness, and Control of Corruption.
+For each of those six dimensions I use six sub-indicators: the governance estimate itself, its
+standard deviation, the number of data sources it's based on, its percentile rank, and the lower
+and upper bounds of its 90% confidence interval. That's 36 indicators describing each country's
+institutional quality, for the most recent year available (2022).
+
+```{r q3a-wgi-load}
+wgi = read.csv("wgidataset.csv")
+wgi = wgi[wgi["year"] == 2022, ]
+
+wgi = pivot_wider(wgi,
+  id_cols = c(code, countryname),
+  names_from = indicator,
+  values_from = c(estimate, stddev, nsource, pctrank, pctranklower, pctrankupper))
+wgi = wgi[!apply(wgi == "..", 1, any), !(colnames(wgi) %in% c("codeindyr", "year"))]
+wgi = as.data.frame(wgi)
+```
+
+A couple of country codes don't match between the two datasets:
+
+```{r q3a-mismatch}
+unique(VC$Country)[!(unique(VC$Country) %in% wgi$code)]
+```
+
+`ROU` (Romania) is coded `ROM` in the WGI data, and `AND` (Andorra) is coded `ADO`, so I fix those
+before filtering the WGI data down to just the countries in my survey extract and scaling the
+indicators:
+
+```{r q3a-clean-scale}
+wgi$code[wgi$code == "ROM"] = "ROU"
+wgi$code[wgi$code == "ADO"] = "AND"
+
+wgi = wgi[wgi$code %in% unique(VC$Country), ]
+rownames(wgi) = wgi$code
+wgi[, 3:length(wgi)] = sapply(wgi[, 3:length(wgi)], function(col) as.numeric(col))
+wgi[, 3:length(wgi)] = scale(wgi[, 3:length(wgi)])
+nrow(wgi)
+```
+
+I fit k-means with $k = \lfloor n/5 \rfloor$ clusters (a rule of thumb aiming for groups of
+around 5 countries), with 20 random starts to stabilise the result:
+
+```{r q3a-kmeans}
+id <- as.numeric(Sys.getenv("STUDENT_ID"))
+set.seed(id)
+country_fit = kmeans(wgi[, 3:length(wgi)], floor(nrow(wgi[, 3:length(wgi)]) / 5), nstart = 20)
+table(country_fit$cluster)
+country_fit$cluster["JPN"]
+cluster_countries = names(country_fit$cluster[country_fit$cluster == country_fit$cluster["JPN"]])
+cluster_countries
+```
+
+Japan's cluster contains 11 countries: **Australia, Canada, Germany, Japan, South Korea, the
+Netherlands, New Zealand, Taiwan, the United Kingdom, the United States, and Uruguay**. These are
+mostly high-income, high-governance-quality democracies, which makes intuitive sense given
+the indicators used.
+
+```{r q3a-pca, fig.width=7, fig.height=6, fig.cap="Figure 6: Visualisation of the k-means clusters (first two principal components), Japan's cluster outlined in black"}
+pca = prcomp(wgi[, 3:length(wgi)], scale. = TRUE)
+pca_df = data.frame(
+  pca$x[, 1:2],
+  Cluster = factor(country_fit$cluster),
+  Country = wgi$code)
+jpn_cluster_id = country_fit$cluster["JPN"]
+
+ggplot(pca_df, aes(PC1, PC2, color = Cluster)) +
+  geom_point(size = 2) +
+  geom_point(data = subset(pca_df, Cluster == jpn_cluster_id),
+             aes(PC1, PC2),
+             shape = 21, fill = NA, color = "black", size = 2, stroke = 1) +
+  theme_minimal()
+```
+
+Japan's cluster (outlined) sits clearly apart from the bulk of countries along the first
+principal component, which broadly separates higher- from lower-governance-quality countries.
+
+---
+
+## Theme 4: Predicting confidence in social institutions
+
+This is the central question of the assignment: how well do participant attributes (trust,
+values, life satisfaction, media use, demographics, etc.) predict confidence in each of the ten
+social institutions in my extract, and does that answer change depending on which group of
+countries the model is trained on?
+
+### 4.1 Modelling approach
+
+For each confidence variable (`CReligious`, `CArmedForces`, `CTelevision`, `CPolice`, `CCourts`,
+`CPParties`, `CUniversities`, `CElections`, `CBanks`, `CEnvOrg`), and for a given group of
+countries, I:
+
+1. Keep only non-confidence predictors (everything *not* prefixed `C`), so one confidence
+   variable is never used to predict another.
+2. Split 70/30 into train/test.
+3. Impute missing values with the training-set mean for that variable.
+4. Z-score standardise predictors, using the training set's mean/SD (and applying the *same*
+   mean/SD to the test set, to avoid leaking test-set information into the transformation).
+5. Fit a full linear regression model, then a bidirectional stepwise model (`step()`, by AIC) to
+   get a more parsimonious model.
+6. Evaluate both on the held-out test set with MSE, MAE, RMSE, R² (train and test), and an
+   "accuracy" score: the predicted values rounded to the nearest integer and clipped to
+   the observed range, then compared to the actual rounded response.
+
+```{r q4-functions}
+lm_country = function(data, label_col, country) {
+  data[data < 0 & data >= -5] = NA
+  data = data[data$Country == country, ]
+  data = data[, !(startsWith(names(data), "C")) | names(data) == label_col]
+  train_rows = sample(nrow(data), floor(nrow(data) * 0.7))
+  train_data = data[train_rows, ]
+  test_data = data[-train_rows, ]
+  for (i in 1:length(train_data)) {
+    if (is.numeric(train_data[[i]])) {
+      mean_NA = mean(train_data[[i]], na.rm = TRUE)
+      train_data[[i]][is.na(train_data[[i]])] = mean_NA
+      test_data[[i]][is.na(test_data[[i]])] = mean_NA
+    }
+  }
+  x_train = train_data[, names(train_data) != label_col]
+  y_train = train_data[, label_col]
+  x_test = test_data[, names(test_data) != label_col]
+  y_test = test_data[, label_col]
+  fit_transformed = fit_transform(x_train)
+  x_train = fit_transformed$scaled_data
+  x_test = transform(
+    x_test,
+    fit_transformed$means,
+    fit_transformed$sds
+  )
+  train_data = cbind(x_train, y_train)
+  names(train_data)[ncol(train_data)] = label_col
+  full_model = lm(as.formula(paste(label_col, "~ .")), data = train_data)
+  step_model = step(full_model, direction = "both", trace = 0) # trace=0: suppress the AIC trace log
+  output = list(
+    model = full_model,
+    x_test = x_test,
+    y_test = y_test,
+    step_model = step_model,
+    train_data = train_data
+  )
+  return(output)
+}
+
+fit_transform = function(data) {
+  means = sapply(
+    data,
+    function(col) if (is.numeric(col)) mean(col, na.rm = TRUE) else NA
+  )
+  sds = sapply(
+    data,
+    function(col) if (is.numeric(col)) sd(col, na.rm = TRUE) else NA
+  )
+  scaled_data = as.data.frame(mapply(function(col, mean, sd) {
+    if (is.numeric(col)) {
+      (col - mean) / sd
+    } else {
+      col
+    }
+  }, data, means, sds, SIMPLIFY = FALSE))
+  output_list = list(scaled_data = scaled_data, means = means, sds = sds)
+  return(output_list)
+}
+
+transform = function(data, means, sds) {
+  for (col in names(data)) {
+    if (is.numeric(data[[col]])) {
+      mean = means[col]
+      sd = sds[col]
+      data[[col]] = (data[[col]] - mean) / sd
+    }
+  }
+  return(data)
+}
+```
+
+I wrap the per-variable loop (full model + stepwise model + metrics) into one function so it can
+be re-run identically for each group of countries, with its own seed for reproducibility:
+
+```{r q4-evaluate-group}
+evaluate_group = function(data, group_label, seed) {
+  set.seed(seed)
+  eval = data.frame(label_col = character(), mse = numeric(), mae = numeric(),
+                     r_squared_train = numeric(), r_squared_test = numeric(),
+                     rmse = numeric(), accuracy = numeric())
+  eval_full = eval
+  lst = list()
+  for (label_col in names(data)) {
+    if (label_col != "Country" & startsWith(label_col, "C")) {
+      res = lm_country(data, label_col, group_label)
+
+      # Full model metrics
+      full_model = res$model
+      predictions_f = predict(full_model, newdata = res$x_test)
+      r_squared_test_f = 1 - sum((res$y_test - predictions_f)^2) / sum((res$y_test - mean(res$y_test))^2)
+      rounded_f = pmin(pmax(round(predictions_f), min(res$y_test)), max(res$y_test))
+      eval_full = rbind(eval_full, data.frame(
+        label_col = label_col,
+        mse = mean((predictions_f - res$y_test)^2),
+        mae = mean(abs(res$y_test - predictions_f)),
+        r_squared_train = summary(full_model)$r.squared,
+        r_squared_test = r_squared_test_f,
+        rmse = sqrt(mean((res$y_test - predictions_f)^2)),
+        accuracy = mean(rounded_f == res$y_test)
+      ))
+
+      # Stepwise model metrics
+      step_model = res$step_model
+      lst = append(lst, list(summary(step_model)))
+      predictions = predict(step_model, newdata = res$x_test)
+      rounded_predictions = round(predictions)
+      rounded_predictions = pmin(pmax(rounded_predictions, min(res$y_test)), max(res$y_test))
+      eval = rbind(eval, data.frame(
+        label_col = label_col,
+        mse = mean((predictions - res$y_test)^2),
+        mae = mean(abs(res$y_test - predictions)),
+        r_squared_train = summary(step_model)$r.squared,
+        r_squared_test = 1 - sum((res$y_test - predictions)^2) / sum((res$y_test - mean(res$y_test))^2),
+        rmse = sqrt(mean((res$y_test - predictions)^2)),
+        accuracy = mean(rounded_predictions == res$y_test)
+      ))
+    }
+  }
+  names(lst) = eval$label_col
+  return(list(eval = eval, eval_full = eval_full, lst = lst))
+}
+
+# Significant (p < 0.05) predictors for each dependent variable's stepwise model
+significant_predictors = function(lst) {
+  for (conf_ind in names(lst)) {
+    summary_lm = as.data.frame(lst[[conf_ind]]$coefficients)["Pr(>|t|)"]
+    rn = rownames(summary_lm)
+    sig = rn[-1][summary_lm[-1, 1] < 0.05]
+    cat("-", conf_ind, ": ", paste(sig, collapse = ", "), "\n\n")
+  }
+}
+
+make_metric_heatmap = function(eval_df, title) {
+  df = eval_df
+  names(df) = c("Column", "MSE", "MAE", "R2 on training data", "R2 on testing data", "RMSE", "Accuracy")
+  m = melt(df, id.vars = "Column")
+  ggplot(m, aes(x = variable, y = Column, fill = value)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient(low = "white", high = "lightblue") +
+    labs(x = "Metric", y = "Dependent variable", title = title) +
+    theme_minimal()
+}
+```
+
+### 4.2 Japan alone
+
+```{r q4-jpn, results='asis'}
+res_jpn = evaluate_group(VC, "JPN", 4001)
+```
+
+**Full model** (all available predictors kept):
+
+```{r q4-jpn-full-table}
+round(res_jpn$eval_full[, -1], 3)
+```
+
+```{r q4-jpn-full-heatmap, fig.width=7, fig.height=5, fig.cap="Figure 3: Full model evaluation for JPN"}
+make_metric_heatmap(res_jpn$eval_full, "JPN - full model")
+```
+
+Without stepwise selection, `CReligious` and `CElections` are the most reliably predicted
+variables in Japan, with R² on testing data of 0.17 and 0.16 respectively, meaning the
+model explains roughly a sixth of the variance in confidence in these two institutions.
+`CPParties` comes third. On accuracy (predictions rounded to the nearest integer on the target's
+own scale), `CPolice` is clearly the strongest at 64.8% correct, followed by `CArmedForces` at
+59.7%.
+
+**Stepwise model** (bidirectional AIC selection on top of the full model):
+
+```{r q4-jpn-step-table}
+round(res_jpn$eval[, -1], 3)
+```
+
+```{r q4-jpn-step-heatmap, fig.width=7, fig.height=5, fig.cap="Figure 4: Stepwise model evaluation for JPN"}
+make_metric_heatmap(res_jpn$eval, "JPN - stepwise model")
+```
+
+Stepwise selection reduces MSE/MAE/RMSE for most of the ten variables, and R² on testing data
+increases for most of them too, while R² on training data drops slightly across the board, which is
+the usual signature of a simpler model that generalises a little better and overfits a little
+less. `CReligious` remains the best-predicted variable by R² (0.20), now followed by `CElections`
+and `CCourts`. `CPolice` again has the best accuracy (64.8%, unchanged from the full model),
+followed by `CArmedForces` (60.6%).
+
+The strongest predictors that `step()` retains, at p < 0.05, for each target variable:
+
+```{r q4-jpn-sig, results='asis'}
+significant_predictors(res_jpn$lst)
+```
+
+### 4.3 The rest of the world, pooled together
+
+Repeating the same stepwise procedure, but this time training on every country *except* Japan,
+pooled into a single "Others" group:
+
+```{r q4-others}
+res_others = evaluate_group(VC_JPN_Others_raw, "Others", 4002)
+round(res_others$eval[, -1], 3)
+```
+
+```{r q4-others-heatmap, fig.width=7, fig.height=5, fig.cap="Figure 5: Stepwise model evaluation for other countries"}
+make_metric_heatmap(res_others$eval, "Other countries - stepwise model")
+```
+
+The contrast with Japan alone is interesting. Error metrics (MSE, RMSE) are substantially higher
+here than for Japan alone, which is unsurprising, given "Others" pools together 64 very different
+countries with very different baseline levels of institutional trust, so there's simply more
+variance to explain. But R² on testing data is, for most variables, *higher* than it was for
+Japan alone: the much larger sample size (tens of thousands of respondents, versus a few hundred
+for Japan) gives the model more to learn from, even though the group itself is far less
+homogeneous. `CReligious`, `CElections`, and `CPParties` remain the most reliably predicted
+variables (the same top three as for Japan's full model).
+
+```{r q4-others-sig, results='asis'}
+significant_predictors(res_others$lst)
+```
+
+The number of statistically significant predictors is much larger here than for Japan alone in
+almost every model, which is again a sample-size effect: with tens of thousands of observations,
+even small effects reach significance.
+
+### 4.4 Japan's cluster of similar countries
+
+Finally, the same procedure again, but training only on the 11 countries identified in Theme 3
+as governance-wise similar to Japan (grouped together as "Cluster", against everyone else):
+
+```{r q4-cluster}
+VC_JPNCluster_Others = VC
+VC_JPNCluster_Others$Country = ifelse(VC$Country %in% cluster_countries, "Cluster", "Others")
+res_cluster = evaluate_group(VC_JPNCluster_Others, "Cluster", 4003)
+round(res_cluster$eval[, -1], 3)
+```
+
+```{r q4-cluster-heatmap, fig.width=7, fig.height=5, fig.cap="Figure 7: Stepwise model evaluation for Japan's cluster of similar countries"}
+make_metric_heatmap(res_cluster$eval, "Japan's cluster - stepwise model")
+```
+
+```{r q4-cluster-sig, results='asis'}
+significant_predictors(res_cluster$lst)
+```
+
+`CReligious`, `CElections`, and `CPParties` are again the three most reliably predicted variables
+(the same ranking as both the "Others" group and Japan's own full model).
+
+### 4.5 Cluster vs. the rest of the world: which is the better comparison group?
+
+The real question the assignment poses is whether Japan's cluster of similar countries gives a
+*better* match to the predictors that matter for Japan than the undifferentiated "all other
+countries" group does. Putting the two stepwise tables side by side:
+
+```{r q4-comparison}
+comparison = data.frame(
+  Variable = res_others$eval$label_col,
+  MSE_others = round(res_others$eval$mse, 3),
+  MSE_cluster = round(res_cluster$eval$mse, 3),
+  R2test_others = round(res_others$eval$r_squared_test, 3),
+  R2test_cluster = round(res_cluster$eval$r_squared_test, 3),
+  Accuracy_others = round(res_others$eval$accuracy, 3),
+  Accuracy_cluster = round(res_cluster$eval$accuracy, 3)
+)
+comparison
+
+cat("MSE lower for the cluster in", sum(res_cluster$eval$mse < res_others$eval$mse), "of 10 variables\n")
+cat("R2 (test) higher for the cluster in", sum(res_cluster$eval$r_squared_test > res_others$eval$r_squared_test), "of 10 variables\n")
+cat("Accuracy higher for the cluster in", sum(res_cluster$eval$accuracy > res_others$eval$accuracy), "of 10 variables\n")
+```
+
+The cluster model wins clearly and consistently. Error (MSE) is lower for the cluster on every
+single one of the ten confidence variables, and accuracy is higher for the cluster on every one
+of the ten as well. R² on testing data is higher for the cluster on 7 of the 10 variables, and
+close to tied on the remaining 3. I believe the cluster model gives the better match to the
+predictors of institutional confidence in Japan, and the likely reason is homogeneity: the
+cluster is a set of countries with genuinely similar governance quality and institutional
+context to Japan, so the *relationship* between personal attributes (trust, values, media use,
+demographics) and institutional confidence looks more similar across that group than it does
+across "the rest of the world" as an undifferentiated whole, even though the "Others"
+group has vastly more data to train on.
+
+---
+
+## Summary of findings
+
+- The dataset is large (50,000 respondents, 65 countries) but unevenly distributed by country,
+  and every numeric variable has a meaningful chunk of missing/non-response codes that need to be
+  handled before modelling (from 0.11% for `MF` up to 6.57% for `CEnvOrg`).
+- Japan differs from the rest of the world most clearly on the importance of religion and
+  confidence in religious institutions (both higher), age (older), family importance (slightly
+  lower), frequency of traditional media use (higher), and perceived control over one's own life
+  (lower).
+- A cluster of 11 high-governance-quality democracies (Australia, Canada, Germany, Japan, South
+  Korea, the Netherlands, New Zealand, Taiwan, the UK, the US, and Uruguay), built from World
+  Bank governance indicators, is a meaningfully different comparison group to "the rest of the
+  world" as a whole.
+- Across every group tested (Japan alone, the rest of the world, and Japan's cluster),
+  confidence in religious institutions, elections, and political parties are consistently the
+  most reliably predicted forms of institutional confidence, while confidence in environmental
+  organisations and banks are consistently among the hardest to predict from these attributes.
+- Modelling Japan against its cluster of similar countries, rather than against the world as a
+  whole, produces lower error and higher accuracy on every single target variable. This is a
+  strong argument for choosing comparison groups by genuine similarity rather than convenience.
+
+---
+
+## Appendix: reproducibility notes
+
+A few small, deliberate departures from how I originally ran this analysis, made purely so the
+whole notebook can be re-run end-to-end and always produce the tables and figures shown above:
+
+- The original analysis was done step-by-step in the R console; some blocks that were re-run
+  interactively (and a few dead-end exploratory lines) have been consolidated here into single,
+  linear functions.
+- `step()` is called with `trace = 0` to suppress its per-iteration AIC log, which would
+  otherwise print pages of intermediate output for each of the 30 stepwise models fit in Theme 4.
+- The four metric heat maps (Figures 3, 4, 5, 7) are built directly from the `eval` tables
+  computed earlier in the same session, rather than via a manually-edited intermediate CSV file.
+- Explicit `set.seed()` calls are placed immediately before the k-means clustering and before
+  each group's train/test-split loop, so re-knitting this document is fully deterministic.
